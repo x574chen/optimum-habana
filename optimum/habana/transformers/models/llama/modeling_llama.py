@@ -157,6 +157,7 @@ class GaudiLlamaAttention(LlamaAttention):
         reuse_cache: Optional[bool] = False,
         use_flash_attention: Optional[bool] = False,
         flash_attention_recompute: Optional[bool] = False,
+        cache_idx = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """
         Copied from LlamaAttention.forward: https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py
@@ -219,6 +220,12 @@ class GaudiLlamaAttention(LlamaAttention):
                 past_value = past_key_value[1]
             key_states = update(past_key, key_states, 2, token_idx, self.inp_seq_len)
             value_states = update(past_value, value_states, 2, token_idx, self.inp_seq_len)
+            
+            if cache_idx is not None and q_len == 1:
+                key_states = key_states[:, :, :cache_idx, :]
+                value_states = value_states[:, :, :cache_idx, :]
+                attention_mask = attention_mask[:, :, :, :cache_idx]
+                kv_seq_len = key_states.shape[-2]
 
         if use_cache:
             if reuse_cache:
@@ -358,6 +365,7 @@ class GaudiLlamaDecoderLayer(LlamaDecoderLayer):
         reuse_cache: Optional[bool] = False,
         use_flash_attention: Optional[bool] = False,
         flash_attention_recompute: Optional[bool] = False,
+        cache_idx = None,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Copied from LlamaDecoderLayer.forward: https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py
@@ -381,6 +389,7 @@ class GaudiLlamaDecoderLayer(LlamaDecoderLayer):
             reuse_cache,
             use_flash_attention=use_flash_attention,
             flash_attention_recompute=flash_attention_recompute,
+            cache_idx = cache_idx,
         )
         self.self_attn.attention_all_reduce(output_pre_attn)
         output_post_attn_pre_mlp, residual_mlp = self.post_attn_pre_mlp(output_pre_attn, residual)
@@ -409,6 +418,7 @@ class GaudiLlamaDecoderLayer(LlamaDecoderLayer):
         reuse_cache: Optional[bool] = False,
         use_flash_attention: Optional[bool] = False,
         flash_attention_recompute: Optional[bool] = False,
+        cache_idx = None,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         hidden_states = self.input_layernorm(hidden_states)
         output_attn, attn_weights, present_key_value = self.self_attn.pre_attn_forward(
@@ -423,6 +433,7 @@ class GaudiLlamaDecoderLayer(LlamaDecoderLayer):
             reuse_cache,
             use_flash_attention,
             flash_attention_recompute,
+            cache_idx = cache_idx,
         )
         return output_attn, attn_weights, present_key_value
 
@@ -471,6 +482,7 @@ class GaudiLlamaModel(LlamaModel):
         reuse_cache: Optional[bool] = False,
         use_flash_attention: Optional[bool] = False,
         flash_attention_recompute: Optional[bool] = False,
+        cache_idx = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         """
         Copied from LlamaModel.forward: https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py
@@ -581,6 +593,7 @@ class GaudiLlamaModel(LlamaModel):
                     reuse_cache=reuse_cache,
                     use_flash_attention=use_flash_attention,
                     flash_attention_recompute=flash_attention_recompute,
+                    cache_idx = cache_idx,
                 )
 
             hidden_states = layer_outputs[0]
@@ -622,6 +635,12 @@ class GaudiLlamaForCausalLM(LlamaForCausalLM):
 
     def allocate_kv_cache(self, batch_size, max_seq_len, inp_seq_len, kv_cache_fp8):
         self.model.allocate_kv_cache(batch_size, max_seq_len, inp_seq_len, kv_cache_fp8)
+        self.kv_cache_len = max_seq_len
+
+    def get_cache_len(self):
+        if not hasattr(self, "kv_cache_len"):
+            return None
+        return self.kv_cache_len
 
     def reorder_kv_cache(self, beam_idx: torch.LongTensor):
         return self.model.reorder_kv_cache(beam_idx)
@@ -647,6 +666,7 @@ class GaudiLlamaForCausalLM(LlamaForCausalLM):
         reuse_cache: Optional[bool] = False,
         use_flash_attention: Optional[bool] = False,
         flash_attention_recompute: Optional[bool] = False,
+        cache_idx = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -669,6 +689,7 @@ class GaudiLlamaForCausalLM(LlamaForCausalLM):
             reuse_cache=reuse_cache,
             use_flash_attention=use_flash_attention,
             flash_attention_recompute=flash_attention_recompute,
+            cache_idx = cache_idx
         )
         hidden_states = outputs[0]
         _, seq_len, _ = hidden_states.shape
@@ -742,6 +763,14 @@ class GaudiLlamaForCausalLM(LlamaForCausalLM):
         else:
             model_inputs = {"input_ids": input_ids}
 
+        bucket_size = kwargs.get("bucket_size")
+        cache_len = self.get_cache_len()
+        cache_idx = None
+        if cache_len and bucket_size > 0:
+            idx = torch.div(token_idx - 1, bucket_size, rounding_mode="floor")
+            if idx < (cache_len // bucket_size):
+                cache_idx = (idx.item() + 1) * bucket_size
+
         model_inputs.update(
             {
                 "position_ids": position_ids,
@@ -754,6 +783,7 @@ class GaudiLlamaForCausalLM(LlamaForCausalLM):
                 "reuse_cache": reuse_cache,
                 "use_flash_attention": kwargs.get("use_flash_attention"),
                 "flash_attention_recompute": kwargs.get("flash_attention_recompute"),
+                "cache_idx": cache_idx,
             }
         )
         return model_inputs

@@ -329,6 +329,7 @@ def setup_generation_config(args, model, tokenizer):
         assert generation_config.bucket_size > 0
     generation_config.kv_cache_fp8 = args.kv_cache_fp8
     generation_config.use_flash_attention = args.use_flash_attention
+    generation_config.bucket_internal = args.bucket_internal
     return generation_config
 
 

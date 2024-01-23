@@ -185,6 +185,7 @@ def setup_parser(parser):
             then we use `shape = prompt_length + max_new_tokens`. If a positive number is passed \
             we increase the bucket in steps of `bucket_size` instead of allocating to max (`prompt_length + max_new_tokens`).",
     )
+    parser.add_argument("--bucket_internal", action="store_true", help="Split kv sequence into buckets in decode phase. It is useful for long new tokens.")
     parser.add_argument(
         "--dataset_max_samples",
         default=-1,

@@ -589,17 +589,20 @@ class GaudiGenerationMixin(GenerationMixin):
                 inputs_tensor, generation_config.pad_token_id, generation_config.eos_token_id
             )
 
-        is_greedy_or_beam_and_bucket = generation_config.bucket_size > 0 and (
+        is_greedy_or_beam_and_bucket = not generation_config.bucket_internal and generation_config.bucket_size > 0 and (
             self._get_generation_mode(generation_config, assistant_model) == GenerationMode.GREEDY_SEARCH
             or self._get_generation_mode(generation_config, assistant_model) == GenerationMode.BEAM_SEARCH
         )
         model_kwargs["bucket_size"] = generation_config.bucket_size if generation_config.static_shapes else -1
+        model_kwargs["bucket_internal"] = generation_config.bucket_internal
         model_kwargs["reduce_recompile"] = (
             generation_config.reduce_recompile if generation_config.reduce_recompile is not None else False
         )
         if model_kwargs["reduce_recompile"]:
             assert generation_config.bucket_size
-        if generation_config.reuse_cache:
+        if generation_config.bucket_internal:
+            assert generation_config.reuse_cache, "please set reuse_cache to use bucket_internal"
+        if generation_config.reuse_cache and not generation_config.bucket_internal:
             assert generation_config.bucket_size <= 0, "reuse_cache and bucketing flags set together"
 
         if generation_config.static_shapes:
@@ -620,6 +623,7 @@ class GaudiGenerationMixin(GenerationMixin):
                             model_kwargs[other_inputs] = torch.nn.functional.pad(
                                 model_kwargs[other_inputs], (0, generation_config.max_new_tokens), value=0
                             )
+
             else:
                 assert generation_config.bucket_size <= 0, "Untested path for bucket>0"
                 token_idx = 1
@@ -1369,13 +1373,15 @@ class GaudiGenerationMixin(GenerationMixin):
         hb_profer.start()
         this_peer_finished = False  # used by synced_gpus only
         bucket_size = model_kwargs["bucket_size"]
+        bucket_internal = model_kwargs["bucket_internal"]
         reduce_recompile = model_kwargs["reduce_recompile"]
 
         prompt_len = input_ids.shape[-1]
-        if bucket_size >= 0:
-            inc = iter(incrementor(bucket_size, prompt_len))
-        if bucket_size > 0:
-            assert "position_ids" not in model_kwargs, "Untested path"
+        if not bucket_internal:
+            if bucket_size >= 0:
+                inc = iter(incrementor(bucket_size, prompt_len))
+            if bucket_size > 0:
+                assert "position_ids" not in model_kwargs, "Untested path"
 
         while True:
             if lazy_mode:
@@ -1391,7 +1397,7 @@ class GaudiGenerationMixin(GenerationMixin):
                 if this_peer_finished_flag.item() == 0.0:
                     break
 
-            if bucket_size > 0:
+            if bucket_size > 0 and not bucket_internal:
                 # it will not have been padded if bucket_size > 0
                 params = next(inc)
                 input_ids, model_kwargs = self.update_model_kwargs_for_bucketing(
